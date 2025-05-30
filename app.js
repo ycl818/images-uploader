@@ -1,9 +1,8 @@
 // 圖片管理頁面
-app.get("/manage", async (req, res) => {
-  try {
-    const images = await readMeta();
-
-    res.send(`
+app.get("/manage", (req, res) => {
+  readMeta()
+    .then((images) => {
+      res.send(`
           <!DOCTYPE html>
           <html>
           <head>
@@ -398,72 +397,89 @@ app.get("/manage", async (req, res) => {
           </body>
           </html>
       `);
-  } catch (error) {
-    res.status(500).send("讀取圖片資料失敗");
-  }
+    })
+    .catch((error) => {
+      console.error("讀取圖片資料失敗:", error);
+      res.status(500).send("讀取圖片資料失敗");
+    });
 });
 
 // API: 獲取所有圖片資訊
-app.get("/api/images", async (req, res) => {
-  try {
-    const images = await readMeta();
-    res.json(images);
-  } catch (error) {
-    res.status(500).json({ error: "讀取圖片資料失敗" });
-  }
+app.get("/api/images", (req, res) => {
+  readMeta()
+    .then((images) => {
+      res.json(images);
+    })
+    .catch((error) => {
+      res.status(500).json({ error: "讀取圖片資料失敗" });
+    });
 });
 
 // API: 刪除單張圖片
-app.delete("/api/images/:id", async (req, res) => {
-  try {
-    const { id } = req.params;
-    const images = await readMeta();
+app.delete("/api/images/:id", (req, res) => {
+  const { id } = req.params;
 
-    const imageIndex = images.findIndex((img) => img.id === id);
-    if (imageIndex === -1) {
-      return res.status(404).json({ error: "圖片不存在" });
-    }
+  readMeta()
+    .then((images) => {
+      const imageIndex = images.findIndex((img) => img.id === id);
+      if (imageIndex === -1) {
+        return res.status(404).json({ error: "圖片不存在" });
+      }
 
-    const image = images[imageIndex];
+      const image = images[imageIndex];
 
-    // 刪除實際檔案
-    try {
-      await fs.unlink(path.join(uploadsDir, image.filename));
-    } catch (fileError) {
-      console.log("檔案已不存在或刪除失敗:", fileError.message);
-    }
+      // 刪除實際檔案
+      fs.unlink(path.join(uploadsDir, image.filename))
+        .then(() => {
+          console.log("檔案已刪除:", image.filename);
+        })
+        .catch((fileError) => {
+          console.log("檔案已不存在或刪除失敗:", fileError.message);
+        });
 
-    // 從 metadata 中移除
-    images.splice(imageIndex, 1);
-    await writeMeta(images);
+      // 從 metadata 中移除
+      images.splice(imageIndex, 1);
 
-    res.json({ success: true, message: "圖片已刪除" });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
+      return writeMeta(images).then(() => {
+        res.json({ success: true, message: "圖片已刪除" });
+      });
+    })
+    .catch((error) => {
+      res.status(500).json({ error: error.message });
+    });
 });
 
 // API: 清空全部圖片
-app.delete("/api/images/clear-all", async (req, res) => {
-  try {
-    const images = await readMeta();
+app.delete("/api/images/clear-all", (req, res) => {
+  readMeta()
+    .then((images) => {
+      // 刪除所有檔案的 Promise 陣列
+      const deletePromises = images.map((image) => {
+        return fs
+          .unlink(path.join(uploadsDir, image.filename))
+          .catch((fileError) => {
+            console.log("檔案刪除失敗:", image.filename, fileError.message);
+          });
+      });
 
-    // 刪除所有檔案
-    for (const image of images) {
-      try {
-        await fs.unlink(path.join(uploadsDir, image.filename));
-      } catch (fileError) {
-        console.log("檔案刪除失敗:", image.filename, fileError.message);
-      }
-    }
-
-    // 清空 metadata
-    await writeMeta([]);
-
-    res.json({ success: true, message: `已刪除 ${images.length} 張圖片` });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
+      // 等待所有檔案刪除完成，然後清空 metadata
+      Promise.all(deletePromises)
+        .then(() => {
+          return writeMeta([]);
+        })
+        .then(() => {
+          res.json({
+            success: true,
+            message: `已刪除 ${images.length} 張圖片`,
+          });
+        })
+        .catch((error) => {
+          res.status(500).json({ error: error.message });
+        });
+    })
+    .catch((error) => {
+      res.status(500).json({ error: error.message });
+    });
 });
 const express = require("express");
 const multer = require("multer");
@@ -736,41 +752,43 @@ app.get("/", (req, res) => {
 });
 
 // 上傳 API
-app.post("/upload", upload.array("images", 10), async (req, res) => {
-  try {
-    if (!req.files || req.files.length === 0) {
-      return res.status(400).json({ error: "沒有檔案被上傳" });
-    }
-
-    const baseUrl = `${req.protocol}://${req.get("host")}`;
-    const images = await readMeta();
-    const newImages = [];
-
-    for (const file of req.files) {
-      const imageData = {
-        id: uuidv4(),
-        filename: file.filename,
-        originalName: file.originalname,
-        mimetype: file.mimetype,
-        size: file.size,
-        url: `${baseUrl}/images/${file.filename}`,
-        uploadTime: new Date().toISOString(),
-      };
-
-      images.push(imageData);
-      newImages.push(imageData);
-    }
-
-    await writeMeta(images);
-
-    res.json({
-      success: true,
-      message: `成功上傳 ${req.files.length} 個檔案`,
-      images: newImages,
-    });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
+app.post("/upload", upload.array("images", 10), (req, res) => {
+  if (!req.files || req.files.length === 0) {
+    return res.status(400).json({ error: "沒有檔案被上傳" });
   }
+
+  const baseUrl = `${req.protocol}://${req.get("host")}`;
+
+  readMeta()
+    .then((images) => {
+      const newImages = [];
+
+      for (const file of req.files) {
+        const imageData = {
+          id: uuidv4(),
+          filename: file.filename,
+          originalName: file.originalname,
+          mimetype: file.mimetype,
+          size: file.size,
+          url: `${baseUrl}/images/${file.filename}`,
+          uploadTime: new Date().toISOString(),
+        };
+
+        images.push(imageData);
+        newImages.push(imageData);
+      }
+
+      return writeMeta(images).then(() => {
+        res.json({
+          success: true,
+          message: `成功上傳 ${req.files.length} 個檔案`,
+          images: newImages,
+        });
+      });
+    })
+    .catch((error) => {
+      res.status(500).json({ error: error.message });
+    });
 });
 
 // 錯誤處理
