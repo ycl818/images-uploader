@@ -35,6 +35,25 @@ async function writeMeta(data) {
   await fs.writeFile(metaFile, JSON.stringify(data, null, 2));
 }
 
+// 生成正確的 HTTPS 網址
+function getBaseUrl(req) {
+  // 檢查 X-Forwarded-Proto header（常見於代理服務器）
+  const protocol = req.headers["x-forwarded-proto"] || req.protocol;
+
+  // 如果是部署環境，強制使用 https
+  if (
+    req.get("host").includes("zeabur.app") ||
+    req.get("host").includes("herokuapp.com") ||
+    req.get("host").includes("vercel.app") ||
+    process.env.NODE_ENV === "production"
+  ) {
+    return `https://${req.get("host")}`;
+  }
+
+  // 本地開發環境使用原始 protocol
+  return `${protocol}://${req.get("host")}`;
+}
+
 // 設定 multer 儲存配置
 const storage = multer.diskStorage({
   destination: function (req, file, cb) {
@@ -74,13 +93,16 @@ const upload = multer({
 // 啟用 CORS
 app.use((req, res, next) => {
   res.header("Access-Control-Allow-Origin", "*");
-  res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS, DELETE");
   res.header(
     "Access-Control-Allow-Headers",
     "Origin, X-Requested-With, Content-Type, Accept"
   );
   next();
 });
+
+// 信任代理服務器（重要：用於正確獲取 protocol）
+app.set("trust proxy", true);
 
 // 靜態檔案服務
 app.use("/images", express.static(uploadsDir));
@@ -268,13 +290,13 @@ app.get("/", (req, res) => {
   `);
 });
 
-// 上傳 API
+// 上傳 API - 使用修正的網址生成方式
 app.post("/upload", upload.array("images", 10), (req, res) => {
   if (!req.files || req.files.length === 0) {
     return res.status(400).json({ error: "沒有檔案被上傳" });
   }
 
-  const baseUrl = `${req.protocol}://${req.get("host")}`;
+  const baseUrl = getBaseUrl(req);
 
   readMeta()
     .then((images) => {
@@ -328,8 +350,7 @@ app.get("/health", (req, res) => {
 app.listen(PORT, () => {
   console.log(`圖片託管服務運行在 port ${PORT}`);
 });
-
-// 圖片管理頁面
+// 圖片管理頁面路由
 app.get("/manage", (req, res) => {
   readMeta()
     .then((images) => {
@@ -458,6 +479,7 @@ app.get("/manage", (req, res) => {
                       display: flex; 
                       gap: 10px; 
                       margin-top: 10px; 
+                      flex-wrap: wrap;
                   }
                   .btn { 
                       padding: 6px 12px; 
@@ -476,16 +498,35 @@ app.get("/manage", (req, res) => {
                       text-align: center; 
                       padding: 60px 20px; 
                       color: #666;
+                      grid-column: 1 / -1;
                   }
                   .empty-state img { 
                       width: 100px; 
                       opacity: 0.3; 
                       margin-bottom: 20px; 
                   }
+                  .bulk-actions {
+                      margin-bottom: 20px;
+                      display: flex;
+                      gap: 10px;
+                      align-items: center;
+                      flex-wrap: wrap;
+                  }
+                  .checkbox {
+                      margin-right: 8px;
+                  }
+                  .selected-count {
+                      background: #007bff;
+                      color: white;
+                      padding: 5px 10px;
+                      border-radius: 4px;
+                      font-size: 0.9em;
+                  }
                   @media (max-width: 768px) {
                       .images-grid { grid-template-columns: 1fr; }
                       .stats { justify-content: center; }
                       .filters { flex-direction: column; align-items: stretch; }
+                      .image-actions { justify-content: center; }
                   }
               </style>
           </head>
@@ -499,6 +540,7 @@ app.get("/manage", (req, res) => {
               </div>
 
               <div class="content">
+                  <!-- 統計卡片 -->
                   <div class="stats">
                       <div class="stat-card">
                           <div class="stat-number" id="totalImages">${
@@ -516,6 +558,15 @@ app.get("/manage", (req, res) => {
                       </div>
                   </div>
 
+                  <!-- 批量操作 -->
+                  <div class="bulk-actions" id="bulkActions" style="display: none;">
+                      <span class="selected-count" id="selectedCount">已選擇 0 張圖片</span>
+                      <button class="btn btn-danger" onclick="deleteSelected()">🗑️ 刪除選中</button>
+                      <button class="btn btn-primary" onclick="selectAll()">全選</button>
+                      <button class="btn" onclick="clearSelection()">取消選擇</button>
+                  </div>
+
+                  <!-- 篩選和搜尋 -->
                   <div class="filters">
                       <input type="text" id="searchInput" class="search-input" placeholder="🔍 搜尋圖片名稱...">
                       <select id="sortSelect" class="sort-select">
@@ -527,6 +578,7 @@ app.get("/manage", (req, res) => {
                       <button class="btn btn-danger" onclick="confirmDeleteAll()">🗑️ 清空全部</button>
                   </div>
 
+                  <!-- 圖片網格 -->
                   <div class="images-grid" id="imagesGrid">
                       ${
                         images.length === 0
@@ -545,6 +597,7 @@ app.get("/manage", (req, res) => {
               <script>
                   let allImages = ${JSON.stringify(images)};
                   let filteredImages = [...allImages];
+                  let selectedImages = new Set();
 
                   // 計算統計資料
                   function calculateStats() {
@@ -568,6 +621,45 @@ app.get("/manage", (req, res) => {
                       return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
                   }
 
+                  // 更新選擇狀態
+                  function updateSelectionUI() {
+                      const count = selectedImages.size;
+                      const bulkActions = document.getElementById('bulkActions');
+                      const selectedCount = document.getElementById('selectedCount');
+                      
+                      if (count > 0) {
+                          bulkActions.style.display = 'flex';
+                          selectedCount.textContent = \`已選擇 \${count} 張圖片\`;
+                      } else {
+                          bulkActions.style.display = 'none';
+                      }
+                  }
+
+                  // 切換圖片選擇狀態
+                  function toggleImageSelection(imageId) {
+                      if (selectedImages.has(imageId)) {
+                          selectedImages.delete(imageId);
+                      } else {
+                          selectedImages.add(imageId);
+                      }
+                      updateSelectionUI();
+                      renderImages();
+                  }
+
+                  // 全選
+                  function selectAll() {
+                      filteredImages.forEach(img => selectedImages.add(img.id));
+                      updateSelectionUI();
+                      renderImages();
+                  }
+
+                  // 清除選擇
+                  function clearSelection() {
+                      selectedImages.clear();
+                      updateSelectionUI();
+                      renderImages();
+                  }
+
                   // 渲染圖片
                   function renderImages() {
                       const grid = document.getElementById('imagesGrid');
@@ -584,9 +676,16 @@ app.get("/manage", (req, res) => {
                       }
 
                       grid.innerHTML = filteredImages.map(img => \`
-                          <div class="image-card" data-id="\${img.id}">
-                              <img src="\${img.url}" alt="\${img.originalName}" class="image-preview" 
-                                   onerror="this.src='data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMjAwIiBoZWlnaHQ9IjIwMCIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj48cmVjdCB3aWR0aD0iMTAwJSIgaGVpZ2h0PSIxMDAlIiBmaWxsPSIjZjBmMGYwIi8+PHRleHQgeD0iNTAlIiB5PSI1MCUiIGZvbnQtZmFtaWx5PSJBcmlhbCIgZm9udC1zaXplPSIxNCIgZmlsbD0iIzk5OSIgdGV4dC1hbmNob3I9Im1pZGRsZSIgZHk9Ii4zZW0iPuWcluePh+eEoeazleS4reWFpTwvdGV4dD48L3N2Zz4='">
+                          <div class="image-card \${selectedImages.has(img.id) ? 'selected' : ''}" data-id="\${img.id}" 
+                               style="\${selectedImages.has(img.id) ? 'border-color: #007bff; box-shadow: 0 0 0 2px rgba(0,123,255,0.25);' : ''}">
+                              <div style="position: relative;">
+                                  <input type="checkbox" class="checkbox" 
+                                         style="position: absolute; top: 10px; left: 10px; z-index: 10;"
+                                         \${selectedImages.has(img.id) ? 'checked' : ''} 
+                                         onchange="toggleImageSelection('\${img.id}')">
+                                  <img src="\${img.url}" alt="\${img.originalName}" class="image-preview" 
+                                       onerror="this.src='data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMjAwIiBoZWlnaHQ9IjIwMCIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj48cmVjdCB3aWR0aD0iMTAwJSIgaGVpZ2h0PSIxMDAlIiBmaWxsPSIjZjBmMGYwIi8+PHRleHQgeD0iNTAlIiB5PSI1MCUiIGZvbnQtZmFtaWx5PSJBcmlhbCIgZm9udC1zaXplPSIxNCIgZmlsbD0iIzk5OSIgdGV4dC1hbmNob3I9Im1pZGRsZSIgZHk9Ii4zZW0iPuWcluePh+eEoeazleS4reWFpTwvdGV4dD48L3N2Zz4='">
+                              </div>
                               <div class="image-info">
                                   <div class="image-name">\${img.originalName}</div>
                                   <div class="image-meta">📅 \${new Date(img.uploadTime).toLocaleString('zh-TW')}</div>
@@ -666,10 +765,12 @@ app.get("/manage", (req, res) => {
                               // 從陣列中移除
                               allImages = allImages.filter(img => img.id !== id);
                               filteredImages = filteredImages.filter(img => img.id !== id);
+                              selectedImages.delete(id);
                               
                               // 更新統計和重新渲染
                               document.getElementById('totalImages').textContent = allImages.length;
                               calculateStats();
+                              updateSelectionUI();
                               renderImages();
                               
                               alert('✅ 圖片已刪除！');
@@ -678,6 +779,50 @@ app.get("/manage", (req, res) => {
                           }
                       } catch (error) {
                           alert('❌ 刪除失敗：' + error.message);
+                      }
+                  }
+
+                  // 刪除選中的圖片
+                  async function deleteSelected() {
+                      if (selectedImages.size === 0) {
+                          alert('請先選擇要刪除的圖片');
+                          return;
+                      }
+
+                      if (!confirm(\`確定要刪除選中的 \${selectedImages.size} 張圖片嗎？\\n\\n⚠️ 此操作無法復原！\`)) {
+                          return;
+                      }
+
+                      const deletePromises = Array.from(selectedImages).map(async (id) => {
+                          try {
+                              const response = await fetch(\`/api/images/\${id}\`, {
+                                  method: 'DELETE'
+                              });
+                              return response.ok;
+                          } catch (error) {
+                              console.error('刪除失敗:', error);
+                              return false;
+                          }
+                      });
+
+                      try {
+                          const results = await Promise.all(deletePromises);
+                          const successCount = results.filter(Boolean).length;
+                          
+                          // 從陣列中移除已刪除的圖片
+                          allImages = allImages.filter(img => !selectedImages.has(img.id));
+                          filteredImages = filteredImages.filter(img => !selectedImages.has(img.id));
+                          selectedImages.clear();
+                          
+                          // 更新統計和重新渲染
+                          document.getElementById('totalImages').textContent = allImages.length;
+                          calculateStats();
+                          updateSelectionUI();
+                          renderImages();
+                          
+                          alert(\`✅ 成功刪除 \${successCount} 張圖片！\`);
+                      } catch (error) {
+                          alert('❌ 批量刪除失敗：' + error.message);
                       }
                   }
 
@@ -706,10 +851,12 @@ app.get("/manage", (req, res) => {
                           if (response.ok) {
                               allImages = [];
                               filteredImages = [];
+                              selectedImages.clear();
                               
                               // 更新統計和重新渲染
                               document.getElementById('totalImages').textContent = 0;
                               calculateStats();
+                              updateSelectionUI();
                               renderImages();
                               
                               alert('✅ 已清空全部圖片！');
@@ -780,6 +927,56 @@ app.delete("/api/images/:id", (req, res) => {
     });
 });
 
+// API: 批量刪除圖片
+app.delete("/api/images/batch", (req, res) => {
+  const { ids } = req.body;
+
+  if (!ids || !Array.isArray(ids) || ids.length === 0) {
+    return res.status(400).json({ error: "請提供要刪除的圖片ID陣列" });
+  }
+
+  readMeta()
+    .then((images) => {
+      const imagesToDelete = images.filter((img) => ids.includes(img.id));
+      const remainingImages = images.filter((img) => !ids.includes(img.id));
+
+      if (imagesToDelete.length === 0) {
+        return res.status(404).json({ error: "沒有找到要刪除的圖片" });
+      }
+
+      // 刪除實際檔案
+      const deletePromises = imagesToDelete.map((image) =>
+        fs
+          .unlink(path.join(uploadsDir, image.filename))
+          .then(() => {
+            console.log("檔案已刪除:", image.filename);
+          })
+          .catch((fileError) => {
+            console.log("檔案已不存在或刪除失敗:", fileError.message);
+          })
+      );
+
+      // 等待所有檔案刪除完成，然後更新 metadata
+      Promise.all(deletePromises)
+        .then(() => {
+          return writeMeta(remainingImages);
+        })
+        .then(() => {
+          res.json({
+            success: true,
+            message: `已刪除 ${imagesToDelete.length} 張圖片`,
+            deletedCount: imagesToDelete.length,
+          });
+        })
+        .catch((error) => {
+          res.status(500).json({ error: error.message });
+        });
+    })
+    .catch((error) => {
+      res.status(500).json({ error: error.message });
+    });
+});
+
 // API: 清空全部圖片
 app.delete("/api/images/clear-all", (req, res) => {
   readMeta()
@@ -807,6 +1004,39 @@ app.delete("/api/images/clear-all", (req, res) => {
         .catch((error) => {
           res.status(500).json({ error: error.message });
         });
+    })
+    .catch((error) => {
+      res.status(500).json({ error: error.message });
+    });
+});
+
+// API: 更新圖片資訊（可選功能）
+app.put("/api/images/:id", (req, res) => {
+  const { id } = req.params;
+  const { originalName } = req.body;
+
+  if (!originalName) {
+    return res.status(400).json({ error: "請提供新的檔案名稱" });
+  }
+
+  readMeta()
+    .then((images) => {
+      const imageIndex = images.findIndex((img) => img.id === id);
+      if (imageIndex === -1) {
+        return res.status(404).json({ error: "圖片不存在" });
+      }
+
+      // 更新圖片資訊
+      images[imageIndex].originalName = originalName;
+      images[imageIndex].updatedTime = new Date().toISOString();
+
+      return writeMeta(images).then(() => {
+        res.json({
+          success: true,
+          message: "圖片資訊已更新",
+          image: images[imageIndex],
+        });
+      });
     })
     .catch((error) => {
       res.status(500).json({ error: error.message });
